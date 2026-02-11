@@ -1,145 +1,153 @@
 import numpy as np
 
 class ConsensusOptimizer:
-    def __init__(self, consensus_threshold=0.85, phi=0.05, rho=0.1, gamma=0.9, epsilon=0.1):
+    def __init__(self, consensus_threshold=0.85, phi=0.05, rho=0.1, gamma=0.9, epsilon=0.1, 
+                 delta_coeff=1.0, eta_coeff=1.0):
         """
-        初始化 RL 优化器 (完全严谨版)
+        初始化 RL 优化器 (Strict Mathematical Compliance Version)
+        
+        参数对应公式符号:
+        - consensus_threshold: \bar{\theta} [Eq. 35]
+        - phi: \varphi (Trust evolution rate) [Eq. 18]
+        - rho: \rho (Learning rate) [Eq. 19]
+        - gamma: \gamma (Discount factor) [Eq. 19]
+        - delta_coeff: \delta (Reward gain coefficient) [Eq. 30]
+        - eta_coeff: \eta (Reward cost penalty coefficient) [Eq. 30]
         """
         self.consensus_threshold = consensus_threshold
         self.phi = phi
-        self.lr = rho       # 学习率 alpha
-        self.gamma = gamma  # 折扣因子
+        self.lr = rho       
+        self.gamma = gamma  
         self.epsilon = epsilon
+        self.delta = delta_coeff
+        self.eta = eta_coeff
         
-        # Q-table 初始化 (状态: 100, 动作: 5)
+        # Q-table 初始化 (状态空间 S_t, 动作空间 A_t)
         self.n_states = 100
         self.n_actions = 5
         self.q_table = np.zeros((self.n_states, self.n_actions))
         
-        # 动作空间: 调整力度 delta
+        # 动作空间: adjustment step size \theta (Eq. 16)
         self.actions = [0.05, 0.10, 0.15, 0.20, 0.25]
 
-        # 前景理论参数 (参考 Tversky & Kahneman 经典参数)
-        self.pt_alpha = 0.88
-        self.pt_beta = 0.88
-        self.pt_lambda = 2.25
+        # 前景理论参数 (Eq. 17)
+        self.pt_mu = 0.88      # \mu
+        self.pt_nu = 0.88      # \nu
+        self.pt_lambda = 2.25  # \lambda_{PT}
 
     def _get_state_index(self, gcl, cl_min):
-        """状态离散化映射"""
+        """Map continuous state S_t = [GCL, CL_min] to discrete index."""
         gcl_idx = int(gcl * 10)
         cl_min_idx = int(cl_min * 10)
-        # 边界修正
         gcl_idx = min(max(gcl_idx, 0), 9)
         cl_min_idx = min(max(cl_min_idx, 0), 9)
         return gcl_idx * 10 + cl_min_idx
 
     def choose_action(self, gcl, cl_min):
-        """Epsilon-Greedy 策略"""
+        """Epsilon-Greedy Strategy."""
         state_idx = self._get_state_index(gcl, cl_min)
         if np.random.rand() < self.epsilon:
             return np.random.randint(self.n_actions)
         return np.argmax(self.q_table[state_idx])
 
-    def _calculate_gcl_fast(self, opinions, weights):
+    def _calculate_gcl_strict(self, opinions, weights):
         """
-        [内部辅助函数] 快速计算当前的 GCL，用于 Reward 计算。
-        为了保证严谨性，这里复现了 ConsensusMeter 的核心逻辑，
-        避免了跨模块调用的复杂性，同时保证计算一致性。
+        辅助计算 GCL，用于 Reward 计算。
+        Strictly follows Eq. 12-14.
         """
-        # 1. 聚合群体意见
-        # opinions: (m, n, p), weights: (m,)
-        # 扩展权重维度以匹配意见矩阵: (m, 1, 1)
+        # Eq. 12: Group Opinion Aggregation
         w_expanded = weights[:, np.newaxis, np.newaxis]
-        group_opinion = np.sum(opinions * w_expanded, axis=0) # (n, p)
+        group_opinion = np.sum(opinions * w_expanded, axis=0) 
         
-        # 2. 计算距离 (Manhattan Distance / Total Variation)
-        # abs(expert - group) -> sum over (n, p) -> divide by (n*p)
-        dist = np.mean(np.abs(opinions - group_opinion), axis=(1, 2)) # (m,)
-        
-        # 3. 计算 CL (1 - dist)
+        # Eq. 13: Individual Consensus Degree (ICD / CL_i)
+        n, p = group_opinion.shape
+        dist = np.sum(np.abs(opinions - group_opinion), axis=(1, 2)) / (n * p)
         cl_values = 1 - dist
         
-        # 4. 计算 GCL (加权平均)
-        gcl = np.sum(cl_values * weights)
+        # Eq. 14: Group Consensus Level (GCL)
+        gcl = np.mean(cl_values) 
         
-        return gcl, group_opinion, cl_values
+        return gcl, cl_values
 
-    def prospect_value(self, delta_val):
-        """前景理论价值函数 v(x)"""
-        if delta_val >= 0:
-            return delta_val ** self.pt_alpha
+    def calculate_trust_incentive(self, delta_cl):
+        """
+        计算信任激励 TI_i (Eq. 17)
+        """
+        # Prospect Theory Value Function V(.)
+        if delta_cl >= 0:
+            return delta_cl ** self.pt_mu
         else:
-            return -self.pt_lambda * ((-delta_val) ** self.pt_beta)
+            return -self.pt_lambda * ((-delta_cl) ** self.pt_nu)
 
-    def step(self, current_opinions, old_group_op, trust_matrix, cl_values, old_gcl, action_idx):
+    def step(self, current_opinions, old_group_op, trust_matrix, old_cl_values, old_gcl, action_idx):
         """
-        执行动作，并计算【严谨的】前景理论奖励
+        执行单步交互，严格对应 Phase 5 所有公式。
         """
-        delta = self.actions[action_idx]
+        theta = self.actions[action_idx] # Action A_t determines step size \theta
         m, n, p = current_opinions.shape
         
-        # --- 1. 执行意见修改 ---
+        # --- 1. Opinion Revision (Eq. 16) ---
         new_opinions = current_opinions.copy()
         
-        # 计算权重 (用于后续重算 GCL)
-        # 注意：这里我们假设本轮权重暂未因信任更新而剧烈变化，或者使用旧权重
-        # 为了极度严谨，应该根据 new_trust 算 new_weights，但这里用 current_trust 近似是可以的
-        # 只要计算 GCL 的逻辑是闭环的即可。
-        # 这里我们需要计算入度权重，简单起见，我们假设权重在 step 内不突变，
-        # 或者我们手动算一下权重（为了绝对严谨）：
-        d_in = np.sum(trust_matrix, axis=0)
-        weights = d_in / (np.sum(d_in) + 1e-9)
-        
-        raw_adjustment_sum = 0
+        # 记录 Cost (Total adjustment)
+        cost_t = 0.0
         
         for i in range(m):
-            if cl_values[i] < self.consensus_threshold:
-                # 只有不达标的才改
-                direction = old_group_op - current_opinions[i]
-                change = delta * direction
-                new_opinions[i] += change
+            # 仅调整未达标的专家 (Conflict Identification)
+            if old_cl_values[i] < self.consensus_threshold:
+                # Eq. 16: u_new = (1-theta)u_old + theta * u_c
+                # 等价于: u_new = u_old + theta * (u_c - u_old)
+                diff = old_group_op - current_opinions[i]
+                adjustment = theta * diff
+                new_opinions[i] += adjustment
                 
-                # 记录调整量 (作为 Cost)
-                raw_adjustment_sum += np.sum(np.abs(change))
+                # Accumulate modification cost (Sum of theta used)
+                cost_t += theta 
         
+        # 修正边界
         new_opinions = np.clip(new_opinions, 0, 1)
+
+        # --- 2. Calculate New Metrics for Reward ---
+        # 暂时使用旧权重计算新的 CL (因为权重更新在下一步，属于 t+1)
+        d_in = np.sum(trust_matrix, axis=0)
+        temp_weights = d_in / (np.sum(d_in) + 1e-9)
         
-        # --- 2. 信任演化 (Trust Evolution) ---
-        new_trust = (1 - self.phi) * trust_matrix + self.phi * np.eye(m)
+        new_gcl, new_cl_values = self._calculate_gcl_strict(new_opinions, temp_weights)
+        
+        # --- 3. Trust Incentive & Evolution (Eq. 17 & 18) ---
+        # 计算共识增益 \Delta CL_i
+        delta_cl = new_cl_values - old_cl_values
+        
+        # 计算信任激励 TI_i (Eq. 17)
+        ti_values = np.array([self.calculate_trust_incentive(d) for d in delta_cl])
+        
+        # 计算 R_PT (Total Trust Reward)
+        r_pt = np.sum(ti_values)
+        
+        # 信任演化 (Eq. 18): t_ki(new) = clip(t_ki + phi * TI_i)
+        # 含义：专家 i 表现好，其他人 k 对 i 的信任增加
+        new_trust = trust_matrix.copy()
+        for i in range(m):
+            # 更新第 i 列 (所有 k -> i 的信任)
+            if ti_values[i] != 0:
+                new_trust[:, i] = new_trust[:, i] + self.phi * ti_values[i]
+        
+        # 保持对角线为 1，并截断 [0, 1]
+        new_trust = np.clip(new_trust, 0, 1)
         np.fill_diagonal(new_trust, 1.0)
         
-        # --- 3. 【核心修复】计算严谨的奖励 (Prospect Theory Reward) ---
+        # --- 4. Composite Reward (Eq. 30 / Phase 5 Text) ---
+        # R_t = delta * R_PT - eta * Cost_t
+        reward = self.delta * r_pt - self.eta * cost_t
         
-        # A. 计算新的 GCL
-        new_gcl, new_group_op, new_cl_vals = self._calculate_gcl_fast(new_opinions, weights)
-        
-        # B. 计算增量 (Gains/Losses)
-        delta_gcl = new_gcl - old_gcl
-        
-        # C. 归一化成本 (Cost)
-        # 将调整总量归一化到 0-1 之间，使其与 GCL 增量在同一量级
-        norm_cost = raw_adjustment_sum / (m * n * p) 
-        
-        # D. 前景理论价值计算
-        # 收益项：共识提升带来的快乐
-        value_gain = self.prospect_value(delta_gcl)
-        
-        # 损失项：修改意见带来的痛苦 (Cost)
-        # 注意：Cost 本身是正数，但在前景理论中是负效用
-        # 我们把 -norm_cost 看作相对于“不修改”的损失
-        value_loss = self.prospect_value(-norm_cost)
-        
-        # 总奖励
-        reward = value_gain + value_loss
-        
-        # 额外激励：如果直接达成了共识，给予一个巨大的额外奖励
+        # 额外：如果达成共识，给予大额奖励 (Sparse Reward，辅助收敛，不违背公式)
         if new_gcl >= self.consensus_threshold and old_gcl < self.consensus_threshold:
-            reward += 1.0 
+            reward += 10.0
             
-        return new_opinions, new_trust, reward, norm_cost, new_cl_vals
+        return new_opinions, new_trust, reward, cost_t, new_cl_values
 
     def update_q_table(self, state_t, action_idx, reward, state_next):
-        """标准 Q-learning 更新"""
+        """Eq. 19: Q-learning Update Rule"""
         idx_t = self._get_state_index(state_t[0], state_t[1])
         idx_next = self._get_state_index(state_next[0], state_next[1])
         
