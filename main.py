@@ -34,8 +34,11 @@ except ImportError as e:
 def train_trust_model(model, h_0, initial_trust_values, initial_trust_mask, epochs=200, lr=0.01):
     print(f"\n[Training GAT] 开始训练信任预测模型 ({epochs} Epochs)...")
     h_0_tensor = h_0.clone().detach()
+    # 注意：这里的 target 应该是被 Mask 过的矩阵 (观测值)
+    # 计算 Loss 时，Loss 函数内部会再次乘以 Mask，确保只计算已知边的误差
     true_matrix_tensor = torch.tensor(initial_trust_values, dtype=torch.float32)
     mask_tensor = torch.tensor(initial_trust_mask, dtype=torch.float32)
+    
     optimizer = optim.Adam(model.parameters(), lr=lr)
     model.train()
     
@@ -61,31 +64,46 @@ def pretrain_rl_agent(optimizer, m, n, p, num_episodes=500):
     for episode in range(num_episodes):
         # 简化环境生成用于快速训练
         raw_data = np.random.uniform(1, 9, size=(m, n, p))
-        current_opinions = (raw_data - 1) / 8.0 # 简易归一化
+        current_opinions = (raw_data - 1) / 8.0 
         trust = np.random.rand(m, m)
         np.fill_diagonal(trust, 1.0)
         
+        # 预训练时需要计算初始 GCL 用于状态初始化
+        weights = calculate_indegree_weight(trust)
+        group_op = meter.aggregate_opinions(current_opinions, weights)
+        cl_vals, gcl = meter.calculate_consensus_levels(current_opinions, group_op)
+        cl_min = np.min(cl_vals)
+
         for t in range(train_max_steps):
-            weights = calculate_indegree_weight(trust)
-            group_op = meter.aggregate_opinions(current_opinions, weights)
-            cl_vals, gcl = meter.calculate_consensus_levels(current_opinions, group_op)
-            cl_min = np.min(cl_vals)
-            
             if meter.detect_conflicts(gcl, optimizer.consensus_threshold):
+                # 已经达成共识则提前结束
                 break
             
             action_idx = optimizer.choose_action(gcl, cl_min)
-            new_ops, new_trust, reward, cost, next_cl = optimizer.step(
+            
+            # 使用新版 step 函数
+            # 注意：step 函数内部已经处理了 weights 的重新计算和 Next State 的生成
+            new_ops, new_trust, reward, cost, next_cl_vals = optimizer.step(
                 current_opinions, group_op, trust, cl_vals, gcl, action_idx
             )
             
-            # Update Q-table
-            next_gcl = np.mean(next_cl)
-            next_cl_min = np.min(next_cl)
+            # 外部只需根据 next_cl_vals 计算简单的统计量供下一次迭代使用
+            next_gcl = np.mean(next_cl_vals)
+            next_cl_min = np.min(next_cl_vals)
+            
             optimizer.update_q_table((gcl, cl_min), action_idx, reward, (next_gcl, next_cl_min))
             
+            # 状态更新
             current_opinions = new_ops
             trust = new_trust
+            cl_vals = next_cl_vals
+            gcl = next_gcl
+            cl_min = next_cl_min
+            
+            # 这里的 group_op 需要在下一次循环前更新吗？
+            # 是的，step 函数内部算了一次用于 Reward，但循环变量也需要更新
+            weights_new = calculate_indegree_weight(trust)
+            group_op = meter.aggregate_opinions(current_opinions, weights_new)
             
     print("[Pre-training RL] 预训练完成。")
     return optimizer
@@ -99,24 +117,37 @@ def main():
     print("==========================================")
 
     # --- 配置开关 ---
-    FORCE_RETRAIN = False  # 如果设为 True，即使有存档也会强制重新训练
+    FORCE_RETRAIN = False 
     
     # 0. 参数设置
     m, n, p = 10, 4, 5
     max_iterations = 20
     consensus_threshold = 0.85
     
-    # 固定随机种子 (保证测试数据一致，不影响模型加载)
     np.random.seed(42) 
     torch.manual_seed(42)
     
-    # 生成测试数据
+    # --- 修正后的数据生成逻辑 ---
+    print("\n[Phase 0] 生成 Ground Truth 数据...")
+    # 1. 生成原始评价矩阵
     raw_data_test = np.random.uniform(1, 9, size=(m, n, p))
     criteria_types = ['benefit', 'benefit', 'cost', 'cost']
     criteria_weights = np.array([0.25, 0.25, 0.25, 0.25]) 
-    initial_trust_mask = (np.random.rand(m, m) < 0.3).astype(np.float64)
-    np.fill_diagonal(initial_trust_mask, 1.0)
-    initial_trust_values = np.random.rand(m, m) * initial_trust_mask
+    
+    # 2. 生成真实的信任网络 (Full Ground Truth)
+    # 先生成一个比较密集的真实网络，或者完全随机
+    true_trust_matrix = np.random.rand(m, m)
+    np.fill_diagonal(true_trust_matrix, 1.0)
+    
+    # 3. 生成观测掩码 (Observation Mask)
+    # 模拟现实中我们只知道部分社交关系 (例如 30%)
+    mask_ratio = 0.3
+    initial_trust_mask = (np.random.rand(m, m) < mask_ratio).astype(np.float64)
+    np.fill_diagonal(initial_trust_mask, 1.0) # 自己信任自己通常是已知的
+    
+    # 4. 生成观测到的信任矩阵 (用于 GAT 输入)
+    # 未被 Mask 的地方设为 0 (或其他填充值，GAT 会处理)
+    initial_trust_values = true_trust_matrix * initial_trust_mask
 
     # Phase 1: HMSIS
     print("\n[Phase 1] 构建 HMSIS...")
@@ -125,7 +156,7 @@ def main():
     h_0_test = hmsis.process(raw_data_test)
 
     # ---------------------------------------------------------
-    # Phase 2: GAT (带存档功能)
+    # Phase 2: GAT
     # ---------------------------------------------------------
     print("\n[Phase 2] 信任网络模块...")
     input_dim = h_0_test.shape[1]
@@ -135,27 +166,30 @@ def main():
     
     if os.path.exists(gat_path) and not FORCE_RETRAIN:
         print(f"  -> 检测到已保存的模型: {gat_path}")
-        print("  -> 正在加载...")
         trust_model.load_state_dict(torch.load(gat_path))
     else:
-        print("  -> 未检测到模型或强制重训，开始训练...")
+        print("  -> 开始训练 GAT...")
+        # 传入观测数据进行训练
         trust_model = train_trust_model(
             trust_model, h_0_test, initial_trust_values, initial_trust_mask, epochs=200
         )
-        print(f"  -> 保存模型至: {gat_path}")
         torch.save(trust_model.state_dict(), gat_path)
     
-    # 推理
+    # 推理：补全信任矩阵
     trust_model.eval()
     with torch.no_grad():
         adj_tensor = torch.tensor(initial_trust_mask, dtype=torch.float32)
         predicted_trust_tensor, _ = trust_model(h_0_test, adj_tensor)
+    
     completed_trust_test = predicted_trust_tensor.numpy()
     np.fill_diagonal(completed_trust_test, 1.0)
-    print("  -> 信任矩阵准备就绪。")
+    
+    # (可选) 可以在这里计算一下补全的准确率 MSE (对比 true_trust_matrix)
+    mse = np.mean((completed_trust_test - true_trust_matrix)**2)
+    print(f"  -> 信任矩阵补全完成。MSE vs Ground Truth: {mse:.4f}")
 
     # ---------------------------------------------------------
-    # Phase 5: RL (带存档功能)
+    # Phase 5: RL
     # ---------------------------------------------------------
     print("\n[Phase 5] 强化学习模块...")
     optimizer = ConsensusOptimizer(consensus_threshold=consensus_threshold, phi=0.05)
@@ -163,20 +197,16 @@ def main():
     q_table_path = os.path.join(models_dir, 'q_table.npy')
     
     if os.path.exists(q_table_path) and not FORCE_RETRAIN:
-        print(f"  -> 检测到已保存的 Q-table: {q_table_path}")
-        print("  -> 正在加载...")
+        print(f"  -> 检测到 Q-table: {q_table_path}")
         loaded_q = np.load(q_table_path)
-        # 简单的形状检查
         if loaded_q.shape == optimizer.q_table.shape:
             optimizer.q_table = loaded_q
         else:
-            print("  [警告] 保存的 Q-table 形状不匹配，重新训练。")
+            print("  [警告] 形状不匹配，重新训练。")
             optimizer = pretrain_rl_agent(optimizer, m, n, p, num_episodes=500)
-            np.save(q_table_path, optimizer.q_table)
     else:
-        print("  -> 未检测到 Q-table 或强制重训，开始预训练...")
+        print("  -> 开始 RL 预训练...")
         optimizer = pretrain_rl_agent(optimizer, m, n, p, num_episodes=500)
-        print(f"  -> 保存 Q-table 至: {q_table_path}")
         np.save(q_table_path, optimizer.q_table)
 
     # ---------------------------------------------------------
@@ -185,8 +215,9 @@ def main():
     print("\n[Phase 3-5] 开始正式测试 (Inference Mode)...")
     optimizer.epsilon = 0.05 
     meter = ConsensusMeter()
+    
     current_opinions = u_scale1_test.copy()
-    current_trust = completed_trust_test.copy()
+    current_trust = completed_trust_test.copy() # 使用 GAT 补全后的矩阵作为初始 T
     
     history_gcl = []       
     history_cost = []      
@@ -194,12 +225,13 @@ def main():
     reached_consensus = False
     final_consensus_matrix = None
     
+    # 初始状态计算
+    weights = calculate_indegree_weight(current_trust)
+    group_opinion = meter.aggregate_opinions(current_opinions, weights)
+    cl_values, gcl = meter.calculate_consensus_levels(current_opinions, group_opinion)
+    cl_min = np.min(cl_values)
+    
     for t in range(max_iterations):
-        expert_weights = calculate_indegree_weight(current_trust)
-        group_opinion = meter.aggregate_opinions(current_opinions, expert_weights)
-        cl_values, gcl = meter.calculate_consensus_levels(current_opinions, group_opinion)
-        cl_min = np.min(cl_values)
-        
         history_gcl.append(gcl)
         history_min_cl.append(cl_min)
         
@@ -213,23 +245,32 @@ def main():
             break
             
         action_idx = optimizer.choose_action(gcl, cl_min)
-        new_ops, new_trust, reward, cost, next_cl = optimizer.step(
+        
+        # 使用修正后的 step
+        new_ops, new_trust, reward, cost, next_cl_vals = optimizer.step(
             current_opinions, group_opinion, current_trust, 
             cl_values, gcl, action_idx
         )
         
-        # 在线学习并更新保存的 Q-table (可选)
-        next_gcl = np.mean(next_cl)
-        next_cl_min = np.min(next_cl)
+        # 统计 Next State
+        next_gcl = np.mean(next_cl_vals)
+        next_cl_min = np.min(next_cl_vals)
+        
         optimizer.update_q_table((gcl, cl_min), action_idx, reward, (next_gcl, next_cl_min))
         
         history_cost.append(cost)
+        
+        # 更新环境变量
         current_opinions = new_ops
         current_trust = new_trust
+        cl_values = next_cl_vals
+        gcl = next_gcl
+        cl_min = next_cl_min
+        
+        # 更新群体共识矩阵 (用于下一轮)
+        weights_new = calculate_indegree_weight(current_trust)
+        group_opinion = meter.aggregate_opinions(current_opinions, weights_new)
     
-    # 每次跑完测试，也可以更新一下 Q-table 存档，越用越聪明
-    # np.save(q_table_path, optimizer.q_table) 
-
     # ---------------------------------------------------------
     # 可视化 (保持不变)
     # ---------------------------------------------------------
@@ -238,8 +279,9 @@ def main():
     plt.figure(figsize=(14, 6))
 
     plt.subplot(1, 2, 1)
-    plt.plot(range(len(history_gcl)), history_gcl, 'b-o', label='GCL', linewidth=2)
-    plt.plot(range(len(history_min_cl)), history_min_cl, 'r--s', label='Min CL', alpha=0.6)
+    if history_gcl:
+        plt.plot(range(len(history_gcl)), history_gcl, 'b-o', label='GCL', linewidth=2)
+        plt.plot(range(len(history_min_cl)), history_min_cl, 'r--s', label='Min CL', alpha=0.6)
     plt.axhline(y=consensus_threshold, color='g', linestyle='--')
     plt.title('Consensus Convergence')
     plt.xlabel('Iteration')
@@ -248,13 +290,16 @@ def main():
     plt.grid(True, linestyle='--', alpha=0.7)
 
     plt.subplot(1, 2, 2)
-    ax1 = plt.gca()
-    ax1.bar(range(len(history_cost)), history_cost, color='orange', alpha=0.5, label='Cost')
-    ax1.set_ylabel('Cost')
-    ax1.set_xlabel('Iteration')
-    ax2 = ax1.twinx()
-    ax2.plot(range(len(history_gcl)), history_gcl, 'b-x')
-    ax2.set_ylabel('GCL')
+    if history_cost:
+        ax1 = plt.gca()
+        ax1.bar(range(len(history_cost)), history_cost, color='orange', alpha=0.5, label='Cost')
+        ax1.set_ylabel('Cost')
+        ax1.set_xlabel('Iteration')
+        ax2 = ax1.twinx()
+        # 对齐长度
+        plot_len = min(len(history_gcl), len(history_cost))
+        ax2.plot(range(plot_len), history_gcl[:plot_len], 'b-x')
+        ax2.set_ylabel('GCL')
     plt.title('Cost Trade-off')
     plt.grid(True, linestyle='--', alpha=0.3)
     
