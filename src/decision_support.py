@@ -95,48 +95,39 @@ class DecisionMaker:
 
     def topsis_ranking(self, consensus_matrix, criteria_weights, target_indices=None):
         """
-        实现公式 (22) 和 (23): TOPSIS 排序。
-        
-        Input:
-            consensus_matrix: (n, p) Numpy array. u_{c,j,l}^*
-            criteria_weights: (n,) Numpy array. v_j
-            target_indices: list (optional). 仅对指定索引的方案进行排序 (例如仅 POS 域)。
-                            如果为 None，则计算所有方案。
-                            
-        Output:
-            closeness_coeffs: (p,) Numpy array. 贴近度系数 C_l^*。
-                              不在 target_indices 中的方案值为 -1。
+        修正版: 严格对应 LaTeX 公式 (22)。
+        先构建加权矩阵，再计算距离。
         """
         n, p = consensus_matrix.shape
-        closeness_coeffs = -1 * np.ones(p) # 初始化为 -1
+        closeness_coeffs = -1 * np.ones(p) 
         
         if target_indices is None:
             target_indices = range(p)
-            
         if len(target_indices) == 0:
             return closeness_coeffs
 
-        # 1. 确定 PIS (Z+) 和 NIS (Z-)
-        # z_j^+ = max_l {u_{c,j,l}}
-        z_plus = np.max(consensus_matrix, axis=1) # (n,)
-        # z_j^- = min_l {u_{c,j,l}}
-        z_minus = np.min(consensus_matrix, axis=1) # (n,)
+        # --- 修正步骤 1: 构建加权决策矩阵 ---
+        # weighted_matrix[j, l] = v_j * u_{c,j,l}
+        # 利用广播: (n, 1) * (n, p) -> (n, p)
+        weighted_matrix = consensus_matrix * criteria_weights[:, np.newaxis]
+
+        # --- 修正步骤 2: 确定加权后的理想解 ---
+        # u_j^+ = max_l (weighted_value)
+        # 注意：这里需要在所有方案(包括非target)中找最大值，还是只在POS区找？
+        # 通常TOPSIS的理想解是基于全局的。
+        u_plus = np.max(weighted_matrix, axis=1) # (n,)
+        u_minus = np.min(weighted_matrix, axis=1) # (n,)
         
-        # 2. 计算距离 D+ 和 D- (公式 22)
-        # D_l = sqrt( sum_j v_j * (u - z)^2 )
-        
+        # --- 修正步骤 3: 计算距离 (公式 22) ---
         for l in target_indices:
-            u_l = consensus_matrix[:, l] # (n,)
+            # 取出当前方案的加权列向量
+            v_l = weighted_matrix[:, l] # (n,)
             
-            # 距离计算 (注意公式中 v_j 是直接乘在平方项外的，不是加权欧氏距离的常规写法，需严格遵循公式)
-            dist_sq_plus = np.sum(criteria_weights * ((u_l - z_plus) ** 2))
-            d_plus = np.sqrt(dist_sq_plus)
+            # 直接计算欧氏距离 (不需要再乘权重，因为已经在矩阵里乘过了)
+            d_plus = np.sqrt(np.sum((v_l - u_plus) ** 2))
+            d_minus = np.sqrt(np.sum((v_l - u_minus) ** 2))
             
-            dist_sq_minus = np.sum(criteria_weights * ((u_l - z_minus) ** 2))
-            d_minus = np.sqrt(dist_sq_minus)
-            
-            # 3. 计算相对贴近度 (公式 23)
-            # C_l = D- / (D+ + D-)
+            # 相对贴近度
             if d_plus + d_minus == 0:
                 score = 0.0
             else:
