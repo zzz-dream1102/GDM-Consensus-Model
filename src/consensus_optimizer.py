@@ -14,23 +14,17 @@ class ConsensusOptimizer:
         self.delta = delta_coeff
         self.eta = eta_coeff
         
-        # State Space S_t = [GCL, CL_min] (离散化映射)
         self.n_states = 100 
-        
-        # Action Space: 对应公式中的调整步长 theta
         self.actions = [0.05, 0.10, 0.15, 0.20, 0.25] 
         self.n_actions = len(self.actions)
         
-        # Q-table 初始化
         self.q_table = np.zeros((self.n_states, self.n_actions))
 
-        # Prospect Theory Parameters (Eq. 17)
         self.pt_mu = 0.88      
         self.pt_nu = 0.88      
         self.pt_lambda = 2.25  
 
     def _get_state_index(self, gcl, cl_min):
-        """映射连续状态 S_t 到离散索引"""
         gcl_idx = int(gcl * 10)
         cl_min_idx = int(cl_min * 10)
         gcl_idx = min(max(gcl_idx, 0), 9)
@@ -38,7 +32,6 @@ class ConsensusOptimizer:
         return gcl_idx * 10 + cl_min_idx
 
     def choose_action(self, gcl, cl_min):
-        """Epsilon-Greedy Action Selection"""
         state_idx = self._get_state_index(gcl, cl_min)
         if np.random.rand() < self.epsilon:
             return np.random.randint(self.n_actions)
@@ -63,9 +56,7 @@ class ConsensusOptimizer:
         return gcl, cl_values
 
     def calculate_trust_incentive(self, delta_cl):
-        """
-        计算前景理论信任激励 TI_i (Eq. 17)
-        """
+        """Eq. 17: PT Value Function"""
         if delta_cl >= 0:
             return delta_cl ** self.pt_mu  
         else:
@@ -73,61 +64,69 @@ class ConsensusOptimizer:
 
     def step(self, current_opinions, old_group_op, trust_matrix, old_cl_values, old_gcl, action_idx):
         """
-        执行 Phase 5 的单步迭代 (严格数学因果律版本)
+        执行 Phase 5 的单步迭代。
+        [AUDIT FIX] 使用定点迭代法解决 Eq.17 和 Eq.12 之间的因果循环。
         """
-        # 1. Action Selection
         theta = self.actions[action_idx] 
         m, n, p = current_opinions.shape
         
+        # --- 1. Opinion Revision (Eq. 50) ---
         new_opinions = current_opinions.copy()
         cost_t = 0.0
-        
-        # --- Eq. 16: Opinion Revision ---
-        # 仅调整未达成共识的专家
         for i in range(m):
             if old_cl_values[i] < self.consensus_threshold:
                 direction = old_group_op - current_opinions[i]
                 adjustment = theta * direction
                 new_opinions[i] += adjustment
-                cost_t += theta # Cost is the sum of step sizes
-        
+                cost_t += theta
         new_opinions = np.clip(new_opinions, 0, 1)
 
-        # --- Calculate Delta CL (Performance Check) ---
-        # 为了计算激励，我们需要看在“原来的信任环境”下，专家改进了多少
-        d_in_old = np.sum(trust_matrix, axis=0)
-        weights_old = d_in_old / (np.sum(d_in_old) + 1e-9)
-        _, temp_cl_values = self._calculate_gcl_strict(new_opinions, weights_old)
+        # --- 2. Fixed-Point Iteration for Trust & Weights ---
+        # 我们需要同时解出 t+1 时刻的 Trust, Weights, 和 CL
+        # 初始猜测：假设 trust 暂时不变
+        temp_trust = trust_matrix.copy()
         
-        delta_cl = temp_cl_values - old_cl_values
-        ti_values = np.array([self.calculate_trust_incentive(d) for d in delta_cl])
+        final_cl_values = None
+        ti_values = None
         
-        # --- Eq. 18: Trust Evolution ---
-        # 信任演化产生 T^(t+1)
-        new_trust = trust_matrix.copy()
-        for i in range(m):
-            if ti_values[i] != 0:
-                # 谁表现好(ti>0)，大家对他的信任(第i列)就增加
-                new_trust[:, i] = new_trust[:, i] + self.phi * ti_values[i]
+        # 迭代求解平衡点 (通常 3-5 次即可收敛)
+        for _ in range(5):
+            # A. 基于当前的 temp_trust 计算权重 (Phase 3)
+            d_in = np.sum(temp_trust, axis=0)
+            temp_weights = d_in / (np.sum(d_in) + 1e-9)
+            
+            # B. 基于新权重计算 CL^(t+1) (Phase 4)
+            _, current_cl_iter = self._calculate_gcl_strict(new_opinions, temp_weights)
+            
+            # C. 计算 Delta CL 和 TI (Eq. 17)
+            delta_cl = current_cl_iter - old_cl_values
+            ti_values = np.array([self.calculate_trust_incentive(d) for d in delta_cl])
+            
+            # D. 更新 Trust (Eq. 18)
+            next_trust_iter = trust_matrix.copy()
+            for i in range(m):
+                if ti_values[i] != 0:
+                    next_trust_iter[:, i] = next_trust_iter[:, i] + self.phi * ti_values[i]
+            
+            # [AUDIT FIX] 公式中只提到了 clip，没提到对角线重置，严格遵守公式则移除 fill_diagonal
+            next_trust_iter = np.clip(next_trust_iter, 0, 1)
+            
+            # 检查收敛性 (可选，这里直接迭代固定次数)
+            temp_trust = next_trust_iter
+            final_cl_values = current_cl_iter
+
+        # 循环结束，temp_trust 即为收敛后的 T^(t+1)
+        new_trust = temp_trust
         
-        new_trust = np.clip(new_trust, 0, 1)
-        np.fill_diagonal(new_trust, 1.0) 
-        
-        # --- Recalculate Weights & Next State ---
-        # 关键修正：信任变了 -> 权重变了 -> 最终的 GCL 也会变
-        d_in_new = np.sum(new_trust, axis=0)
-        weights_new = d_in_new / (np.sum(d_in_new) + 1e-9)
-        
-        # 计算 Agent 真正观测到的 Next State
-        final_gcl, final_cl_values = self._calculate_gcl_strict(new_opinions, weights_new)
-        
-        # --- Reward Calculation ---
+        # 计算最终状态 S_{t+1}
+        d_in_final = np.sum(new_trust, axis=0)
+        weights_final = d_in_final / (np.sum(d_in_final) + 1e-9)
+        final_gcl, _ = self._calculate_gcl_strict(new_opinions, weights_final)
+
+        # --- 3. Reward Calculation (Strict Eq. 19) ---
+        # [AUDIT FIX] 移除了 +10.0 的虚构奖励
         r_pt = np.sum(ti_values)
         reward = self.delta * r_pt - self.eta * cost_t
-        
-        # 稀疏奖励：达成共识给大奖
-        if final_gcl >= self.consensus_threshold and old_gcl < self.consensus_threshold:
-            reward += 10.0
             
         return new_opinions, new_trust, reward, cost_t, final_cl_values
 
